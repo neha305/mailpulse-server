@@ -38,16 +38,18 @@ function saveDB(db) {
 // Known bots and crawlers to ignore
 const BOT_RE = /Googlebot|Bingbot|Slurp|DuckDuckBot|Baiduspider|YandexBot|Twitterbot|LinkedInBot|MailchimpBot|Postmark|SendGrid|Litmus|EmailOnAcid|curl|wget/i;
 
-// Google's Gmail image proxy — this is what pre-fetches images on delivery,
-// NOT a real human open. Must be filtered separately from Googlebot.
-const GMAIL_PROXY_RE = /GoogleImageProxy|Google Image Proxy/i;
+// Google's Gmail image proxy UAs
+const GMAIL_PROXY_RE = /GoogleImageProxy|Google Image Proxy|ggpht\.com/i;
+
+// Google IP ranges that proxy Gmail images (66.249.x.x, 72.14.x.x, 74.125.x.x, 209.85.x.x)
+const GOOGLE_IP_RE = /^(66\.249\.|72\.14\.|74\.125\.|209\.85\.|64\.233\.|108\.177\.|142\.250\.|172\.217\.|173\.194\.|216\.58\.)/;
 
 function isBot(userAgent = "") {
   return BOT_RE.test(userAgent);
 }
 
-function isGmailProxy(userAgent = "") {
-  return GMAIL_PROXY_RE.test(userAgent);
+function isGmailProxy(userAgent = "", ip = "") {
+  return GMAIL_PROXY_RE.test(userAgent) || GOOGLE_IP_RE.test(ip);
 }
 
 // ─── Pixel endpoint ───────────────────────────────────────────────────────
@@ -76,7 +78,7 @@ app.get("/pixel/:id.gif", (req, res) => {
     return;
   }
 
-  if (isGmailProxy(ua)) {
+  if (isGmailProxy(ua, ip)) {
     console.log(`[PROXY] ${id} | ${ip} | Gmail image proxy — not a real open`);
     return;
   }

@@ -68,9 +68,18 @@ app.get("/pixel/:id.gif", (req, res) => {
   }
 
   const db = loadDB();
-  if (!db[id]) db[id] = { opens: [] };
+  if (!db[id]) db[id] = { firstFetch: null, opens: [] };
 
-  // Deduplicate: ignore opens within 5 seconds from the same IP (double-load prevention)
+  // Google's proxy pre-fetches images on delivery — skip the very first load
+  // as it is almost always Google's cache warmup, not a real human open.
+  if (!db[id].firstFetch) {
+    db[id].firstFetch = { timestamp: Date.now(), ip, userAgent: ua };
+    saveDB(db);
+    console.log(`[PREFETCH] ${id} | ${ip} | skipping first load`);
+    return;
+  }
+
+  // Deduplicate: ignore opens within 5 seconds from the same IP
   const recent = db[id].opens.filter((o) => o.ip === ip && Date.now() - o.timestamp < 5000);
   if (recent.length) return;
 

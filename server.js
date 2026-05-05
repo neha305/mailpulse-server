@@ -35,10 +35,19 @@ function saveDB(db) {
 
 // ─── Bot detection ────────────────────────────────────────────────────────
 
+// Known bots and crawlers to ignore
 const BOT_RE = /Googlebot|Bingbot|Slurp|DuckDuckBot|Baiduspider|YandexBot|Twitterbot|LinkedInBot|MailchimpBot|Postmark|SendGrid|Litmus|EmailOnAcid|curl|wget/i;
+
+// Google's Gmail image proxy — this is what pre-fetches images on delivery,
+// NOT a real human open. Must be filtered separately from Googlebot.
+const GMAIL_PROXY_RE = /GoogleImageProxy|Google Image Proxy/i;
 
 function isBot(userAgent = "") {
   return BOT_RE.test(userAgent);
+}
+
+function isGmailProxy(userAgent = "") {
+  return GMAIL_PROXY_RE.test(userAgent);
 }
 
 // ─── Pixel endpoint ───────────────────────────────────────────────────────
@@ -67,27 +76,43 @@ app.get("/pixel/:id.gif", (req, res) => {
     return;
   }
 
-  const db = loadDB();
-  if (!db[id]) db[id] = { firstFetch: null, opens: [] };
-
-  // Google's proxy pre-fetches images on delivery — skip the very first load
-  // as it is almost always Google's cache warmup, not a real human open.
-  if (!db[id].firstFetch) {
-    db[id].firstFetch = { timestamp: Date.now(), ip, userAgent: ua };
-    saveDB(db);
-    console.log(`[PREFETCH] ${id} | ${ip} | skipping first load`);
+  if (isGmailProxy(ua)) {
+    console.log(`[PROXY] ${id} | ${ip} | Gmail image proxy — not a real open`);
     return;
   }
 
-  // Deduplicate: ignore opens within 5 seconds from the same IP
-  const recent = db[id].opens.filter((o) => o.ip === ip && Date.now() - o.timestamp < 5000);
+  const db = loadDB();
+  if (!db[id]) db[id] = { registeredAt: null, opens: [] };
+
+  const now = Date.now();
+
+  // Deduplicate: ignore opens within 10 seconds from the same IP
+  const recent = db[id].opens.filter((o) => o.ip === ip && now - o.timestamp < 10000);
   if (recent.length) return;
 
-  const open = { timestamp: Date.now(), ip, userAgent: ua };
+  const open = { timestamp: now, ip, userAgent: ua };
   db[id].opens.push(open);
   saveDB(db);
 
   console.log(`[OPEN ] ${id} | ${ip} | ${new Date(open.timestamp).toISOString()}`);
+});
+
+// ─── Register pixels at send time ────────────────────────────────────────
+// POST /api/register  { ids: ["mpXXX", ...], sentAt: 1234567890 }
+// Call this immediately after sending so we know when to start trusting loads
+
+app.post("/api/register", (req, res) => {
+  const { ids, sentAt } = req.body;
+  if (!Array.isArray(ids)) return res.status(400).json({ error: "ids required" });
+  const db = loadDB();
+  const ts = sentAt || Date.now();
+  for (const id of ids) {
+    if (!db[id]) db[id] = { registeredAt: ts, opens: [] };
+    else db[id].registeredAt = ts;
+  }
+  saveDB(db);
+  console.log(`[REG  ] ${ids.length} pixels registered at ${new Date(ts).toISOString()}`);
+  res.json({ ok: true });
 });
 
 // ─── Batch query — extension polls this to sync all opens ─────────────────

@@ -13,7 +13,6 @@ app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"], allowedHeaders:
 app.options("*", cors());
 app.use(express.json());
 
-// 1x1 transparent GIF
 const PIXEL_GIF = Buffer.from(
   "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
   "base64"
@@ -28,12 +27,40 @@ function saveDB(db) {
   fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
 
+// Known bots
 const BOT_RE = /Googlebot|Bingbot|Slurp|DuckDuckBot|Baiduspider|YandexBot|Twitterbot|LinkedInBot|MailchimpBot|Postmark|SendGrid|Litmus|EmailOnAcid|curl|wget/i;
 
-function isBot(ua) { return BOT_RE.test(ua); }
+// Google's Gmail image proxy user agents (all known variants)
+const GMAIL_PROXY_UA_RE = /GoogleImageProxy|ggpht\.com|Google Image Proxy/i;
 
-// ─── GIF pixel — served to satisfy <img> tag, Google proxy loads this ────
-// We log it but do NOT record it as a real open.
+// Google IP ranges used for Gmail image proxying
+// Source: Google's published SPF records + observed ranges
+function isGoogleIP(ip) {
+  const googleRanges = [
+    /^66\.249\./,   // 66.249.80.0/20
+    /^72\.14\./,    // 72.14.192.0/18
+    /^74\.125\./,   // 74.125.0.0/16
+    /^64\.233\./,   // 64.233.160.0/19
+    /^209\.85\./,   // 209.85.128.0/17
+    /^108\.177\./,  // 108.177.0.0/17
+    /^173\.194\./,  // 173.194.0.0/16
+    /^216\.58\./,   // 216.58.192.0/19
+    /^216\.239\./,  // 216.239.32.0/19
+    /^142\.250\./,  // 142.250.0.0/15
+    /^172\.217\./,  // 172.217.0.0/16
+  ];
+  return googleRanges.some(r => r.test(ip));
+}
+
+function isGmailProxy(ua, ip) {
+  return GMAIL_PROXY_UA_RE.test(ua) || isGoogleIP(ip);
+}
+
+function isBot(ua) {
+  return BOT_RE.test(ua);
+}
+
+// ─── Pixel endpoint ───────────────────────────────────────────────────────
 
 app.get("/pixel/:id.gif", (req, res) => {
   res.set({
@@ -48,43 +75,37 @@ app.get("/pixel/:id.gif", (req, res) => {
   const id = req.params.id;
   const ua = req.headers["user-agent"] || "";
   const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
-  console.log(`[GIF  ] ${id} | ${ip} | ${ua.slice(0, 80)}`);
-});
-
-// ─── Real open endpoint — called by JS in the email ──────────────────────
-// Google's proxy does NOT execute JavaScript, so only real human opens
-// in a browser (Gmail web, Outlook web, etc.) will hit this endpoint.
-
-app.get("/open/:id", (req, res) => {
-  res.set({
-    "Content-Type": "text/plain",
-    "Cache-Control": "no-store, no-cache, must-revalidate, private",
-  });
-  res.status(200).end("ok");
-
-  const id = req.params.id;
-  const ua = req.headers["user-agent"] || "";
-  const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
 
   console.log(`[HIT  ] ${id} | ${ip} | ${ua.slice(0, 100)}`);
 
   if (isBot(ua)) {
-    console.log(`[BOT  ] ${id} | ${ip}`);
+    console.log(`[BOT  ] ${id} — known bot UA`);
+    return;
+  }
+
+  if (isGmailProxy(ua, ip)) {
+    console.log(`[PROXY] ${id} — Gmail proxy (UA or IP match)`);
     return;
   }
 
   const db = loadDB();
-  if (!db[id]) db[id] = { opens: [] };
+  if (!db[id]) db[id] = { registeredAt: null, opens: [] };
 
   const now = Date.now();
-  // Deduplicate within 30 seconds from same IP
-  const recent = db[id].opens.filter((o) => o.ip === ip && now - o.timestamp < 30000);
+
+  // Time-based filter: ignore opens within 30s of send (Google prefetch fallback)
+  if (db[id].registeredAt && (now - db[id].registeredAt) < 30000) {
+    console.log(`[EARLY] ${id} — ${Math.round((now - db[id].registeredAt)/1000)}s after send, likely prefetch`);
+    return;
+  }
+
+  // Deduplicate within 30s from same IP
+  const recent = db[id].opens.filter(o => o.ip === ip && now - o.timestamp < 30000);
   if (recent.length) return;
 
   const open = { timestamp: now, ip, userAgent: ua };
   db[id].opens.push(open);
   saveDB(db);
-
   console.log(`[OPEN ] ${id} | ${ip} | ${new Date(open.timestamp).toISOString()}`);
 });
 
@@ -100,17 +121,15 @@ app.post("/api/register", (req, res) => {
     else db[id].registeredAt = ts;
   }
   saveDB(db);
-  console.log(`[REG  ] ${ids.length} pixels registered`);
+  console.log(`[REG  ] ${ids.length} pixels registered at ${new Date(ts).toISOString()}`);
   res.json({ ok: true });
 });
 
-// ─── Batch query — extension polls this to sync opens ────────────────────
+// ─── Batch query ──────────────────────────────────────────────────────────
 
 app.post("/api/opens", (req, res) => {
   const { ids } = req.body;
-  if (!Array.isArray(ids) || !ids.length) {
-    return res.status(400).json({ error: "ids must be a non-empty array" });
-  }
+  if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: "ids required" });
   const db = loadDB();
   const opens = {};
   for (const id of ids) {
@@ -123,11 +142,7 @@ app.post("/api/opens", (req, res) => {
 
 app.get("/health", (_req, res) => res.json({ ok: true, timestamp: Date.now() }));
 
-// ─── Start ────────────────────────────────────────────────────────────────
-
 app.listen(PORT, () => {
   console.log(`\n✅  MailPulse tracking server v2`);
-  console.log(`    http://localhost:${PORT}`);
-  console.log(`    Pixel: GET /pixel/:id.gif  (Google proxy, ignored)`);
-  console.log(`    Open:  GET /open/:id       (JS beacon, real opens only)\n`);
+  console.log(`    http://localhost:${PORT}\n`);
 });
